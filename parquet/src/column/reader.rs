@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -168,11 +169,12 @@ where
 {
     pub(crate) fn new_with_decoders(
         descr: ColumnDescPtr,
-        page_reader: Box<dyn PageReader>,
+        mut page_reader: Box<dyn PageReader>,
         values_decoder: V,
         def_level_decoder: Option<D>,
         rep_level_decoder: Option<R>,
     ) -> Self {
+        page_reader.set_streaming_consumer(V::supports_streaming());
         Self {
             descr,
             def_level_decoder,
@@ -233,7 +235,9 @@ where
         let mut total_values_read = 0;
 
         while total_records_read < max_records && self.has_next()? {
-            let remaining_records = max_records - total_records_read;
+            let stream_limit = self.values_decoder.streaming_batch_limit();
+            let remaining_records =
+                (max_records - total_records_read).min(stream_limit.unwrap_or(usize::MAX));
             let remaining_levels = self.num_buffered_values - self.num_decoded_values;
 
             let (records_read, levels_to_read) = match self.rep_level_decoder.as_mut() {
@@ -299,6 +303,12 @@ where
             total_records_read += records_read;
             total_levels_read += levels_to_read;
             total_values_read += values_read;
+            if self.num_decoded_values == self.num_buffered_values {
+                self.values_decoder.finish_stream()?;
+            }
+            if stream_limit.is_some() {
+                break;
+            }
         }
 
         Ok((total_records_read, total_values_read, total_levels_read))
@@ -377,7 +387,10 @@ where
             remaining_records -= records_read;
 
             if self.num_buffered_values == self.num_decoded_values {
-                // Exhausted buffered page - no need to advance other decoders
+                // Exhausted buffered page - no need to advance other decoders.
+                // Addressed range streams can be released without seeking/draining
+                // a shared file cursor.
+                self.values_decoder.discard_stream();
                 continue;
             }
 
@@ -500,6 +513,9 @@ where
                                 num_values as usize,
                                 None,
                             )?;
+                            if let Some(stream) = self.page_reader.take_value_stream() {
+                                self.values_decoder.set_stream(stream)?;
+                            }
                             return Ok(true);
                         }
                         // 3. Data page v2
@@ -558,6 +574,9 @@ where
                                 num_values as usize,
                                 Some((num_values - num_nulls) as usize),
                             )?;
+                            if let Some(stream) = self.page_reader.take_value_stream() {
+                                self.values_decoder.set_stream(stream)?;
+                            }
                             return Ok(true);
                         }
                     };

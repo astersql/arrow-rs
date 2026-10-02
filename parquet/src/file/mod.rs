@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -111,3 +112,6 @@ pub mod writer;
 pub const FOOTER_SIZE: usize = 8;
 const PARQUET_MAGIC: [u8; 4] = *b"PAR1";
 const PARQUET_MAGIC_ENCR_FOOTER: [u8; 4] = *b"PARE";
+
+/// Incremental value source for eligible PLAIN byte-array data pages.
+pub mod page_streaming;
