@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -1983,12 +1984,18 @@ const DEFAULT_READ_PAGE_STATS: bool = false;
 ///     .build();
 /// ```
 pub struct ReaderProperties {
+    page_streaming_enabled: bool,
     codec_options: CodecOptions,
     read_bloom_filter: bool,
     read_page_stats: bool,
 }
 
 impl ReaderProperties {
+    /// Whether eligible PLAIN byte-array pages are decoded incrementally.
+    pub fn page_streaming_enabled(&self) -> bool {
+        self.page_streaming_enabled
+    }
+
     /// Returns builder for reader properties with default values.
     pub fn builder() -> ReaderPropertiesBuilder {
         ReaderPropertiesBuilder::with_defaults()
@@ -2013,6 +2020,7 @@ impl ReaderProperties {
 /// Builder for parquet file reader configuration. See example on
 /// [`ReaderProperties`]
 pub struct ReaderPropertiesBuilder {
+    page_streaming_enabled: bool,
     codec_options_builder: CodecOptionsBuilder,
     read_bloom_filter: Option<bool>,
     read_page_stats: Option<bool>,
@@ -2020,9 +2028,19 @@ pub struct ReaderPropertiesBuilder {
 
 /// Reader properties builder.
 impl ReaderPropertiesBuilder {
+    /// Decode PLAIN BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY pages larger than 1 MiB
+    /// incrementally for UNCOMPRESSED, GZIP, BROTLI and ZSTD. Other pages retain
+    /// the existing decoder. Default false. Typed column reads may return smaller
+    /// batches to bound value buffers; a single large value may exceed the budget.
+    pub fn set_page_streaming_enabled(mut self, enabled: bool) -> Self {
+        self.page_streaming_enabled = enabled;
+        self
+    }
+
     /// Returns default state of the builder.
     fn with_defaults() -> Self {
         Self {
+            page_streaming_enabled: false,
             codec_options_builder: CodecOptionsBuilder::default(),
             read_bloom_filter: None,
             read_page_stats: None,
@@ -2032,6 +2050,7 @@ impl ReaderPropertiesBuilder {
     /// Finalizes the configuration and returns immutable reader properties struct.
     pub fn build(self) -> ReaderProperties {
         ReaderProperties {
+            page_streaming_enabled: self.page_streaming_enabled,
             codec_options: self.codec_options_builder.build(),
             read_bloom_filter: self.read_bloom_filter.unwrap_or(DEFAULT_READ_BLOOM_FILTER),
             read_page_stats: self.read_page_stats.unwrap_or(DEFAULT_READ_PAGE_STATS),

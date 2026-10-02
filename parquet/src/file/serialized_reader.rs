@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -585,6 +586,11 @@ pub struct SerializedPageReader<R: ChunkReader> {
     state: SerializedPageReaderState,
 
     context: SerializedPageReaderContext,
+    streaming_enabled: bool,
+    streaming_consumer: bool,
+    stream: Option<crate::file::page_streaming::ValueStream>,
+    compression: crate::basic::Compression,
+    column: crate::schema::types::ColumnDescPtr,
 }
 
 impl<R: ChunkReader> SerializedPageReader<R> {
@@ -686,6 +692,11 @@ impl<R: ChunkReader> SerializedPageReader<R> {
             decompressor,
             state,
             physical_type: meta.column_type(),
+            streaming_enabled: props.page_streaming_enabled(),
+            streaming_consumer: false,
+            stream: None,
+            compression: meta.compression(),
+            column: meta.column_descr_ptr(),
             context,
         })
     }
@@ -904,7 +915,7 @@ impl SerializedPageReaderContext {
     }
 }
 
-impl<R: ChunkReader> Iterator for SerializedPageReader<R> {
+impl<R: ChunkReader + 'static> Iterator for SerializedPageReader<R> {
     type Item = Result<Page>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -933,8 +944,19 @@ pub(crate) fn verify_page_size(
     Ok(())
 }
 
-impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
+impl<R: ChunkReader + 'static> PageReader for SerializedPageReader<R> {
+    fn set_streaming_consumer(&mut self, enabled: bool) {
+        self.streaming_consumer = enabled;
+    }
+    fn take_value_stream(&mut self) -> Option<crate::file::page_streaming::ValueStream> {
+        self.stream.take()
+    }
+
     fn get_next_page(&mut self) -> Result<Option<Page>> {
+        self.stream = None;
+        let can_stream = self.streaming_enabled && self.streaming_consumer;
+        #[cfg(feature = "encryption")]
+        let can_stream = can_stream && self.context.crypto_context.is_none();
         loop {
             let page = match &mut self.state {
                 SerializedPageReaderState::Values {
@@ -977,6 +999,28 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         continue;
                     }
 
+                    if can_stream
+                        && crate::file::page_streaming::eligible(
+                            &header,
+                            self.compression,
+                            &self.column,
+                        )
+                    {
+                        let read = crate::file::page_streaming::RangeReader::new(
+                            Arc::clone(&self.reader),
+                            data_start,
+                            data_len,
+                        );
+                        let (page, stream) = crate::file::page_streaming::open(
+                            Box::new(read),
+                            header,
+                            self.compression,
+                            &self.column,
+                        )?;
+                        self.stream = Some(stream);
+                        *page_index += 1;
+                        return Ok(Some(page));
+                    }
                     let buffer = self.reader.get_bytes(data_start, data_len)?;
 
                     let buffer =
@@ -1011,6 +1055,41 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     };
 
                     let page_len = usize::try_from(front.compressed_page_size)?;
+                    if can_stream && !is_dictionary_page {
+                        let mut read = self.reader.get_read(front.offset as u64)?;
+                        let (header_len, header) = Self::read_page_header_len(
+                            &self.context,
+                            &mut read,
+                            *page_index,
+                            false,
+                        )?;
+                        verify_page_header_len(header_len, page_len as u64)?;
+                        verify_page_size(
+                            header.compressed_page_size,
+                            header.uncompressed_page_size,
+                            (page_len - header_len) as u64,
+                        )?;
+                        if crate::file::page_streaming::eligible(
+                            &header,
+                            self.compression,
+                            &self.column,
+                        ) {
+                            let read = crate::file::page_streaming::RangeReader::new(
+                                Arc::clone(&self.reader),
+                                front.offset as u64 + header_len as u64,
+                                usize::try_from(header.compressed_page_size)?,
+                            );
+                            let (page, stream) = crate::file::page_streaming::open(
+                                Box::new(read),
+                                header,
+                                self.compression,
+                                &self.column,
+                            )?;
+                            self.stream = Some(stream);
+                            *page_index += 1;
+                            return Ok(Some(page));
+                        }
+                    }
                     let buffer = self.reader.get_bytes(front.offset as u64, page_len)?;
 
                     let (offset, header) = read_page_header_len_from_bytes(

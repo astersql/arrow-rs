@@ -1,3 +1,4 @@
+// Copyright 2026 AsterSQL.
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -87,6 +88,25 @@ pub trait DefinitionLevelDecoder: ColumnLevelDecoder {
 
 /// Decodes value data
 pub trait ColumnValueDecoder {
+    /// Whether this decoder understands incremental PLAIN byte-array values.
+    fn supports_streaming() -> bool {
+        false
+    }
+    /// Install a value source for the current page.
+    fn set_stream(&mut self, _stream: crate::file::page_streaming::ValueStream) -> Result<()> {
+        Err(general_err!("Decoder does not support streaming"))
+    }
+    /// Suggested maximum number of records for one streamed value batch.
+    fn streaming_batch_limit(&self) -> Option<usize> {
+        None
+    }
+    /// Release a value source after skipping the rest of its page.
+    fn discard_stream(&mut self) {}
+    /// Validate complete consumption of a streamed page.
+    fn finish_stream(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     type Buffer;
 
     /// Create a new [`ColumnValueDecoder`]
@@ -142,6 +162,7 @@ const ENCODING_SLOTS: usize = Encoding::MAX_DISCRIMINANT as usize + 1;
 
 /// An implementation of [`ColumnValueDecoder`] for `[T::T]`
 pub struct ColumnValueDecoderImpl<T: DataType> {
+    stream: Option<crate::file::page_streaming::ValueStream>,
     descr: ColumnDescPtr,
 
     current_encoding: Option<Encoding>,
@@ -153,10 +174,31 @@ pub struct ColumnValueDecoderImpl<T: DataType> {
 }
 
 impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
+    fn supports_streaming() -> bool {
+        true
+    }
+    fn set_stream(&mut self, stream: crate::file::page_streaming::ValueStream) -> Result<()> {
+        self.stream = Some(stream);
+        Ok(())
+    }
+    fn streaming_batch_limit(&self) -> Option<usize> {
+        self.stream.as_ref().map(|s| s.batch_limit)
+    }
+    fn discard_stream(&mut self) {
+        self.stream = None;
+    }
+    fn finish_stream(&mut self) -> Result<()> {
+        if let Some(mut stream) = self.stream.take() {
+            stream.finish()?;
+        }
+        Ok(())
+    }
+
     type Buffer = Vec<T::T>;
 
     fn new(descr: &ColumnDescPtr) -> Self {
         Self {
+            stream: None,
             descr: descr.clone(),
             current_encoding: None,
             decoder_mask: EncodingMask::default(),
@@ -203,6 +245,7 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
         num_levels: usize,
         num_values: Option<usize>,
     ) -> Result<()> {
+        self.stream = None;
         if encoding == Encoding::PLAIN_DICTIONARY {
             encoding = Encoding::RLE_DICTIONARY;
         }
@@ -229,6 +272,36 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
     }
 
     fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize> {
+        if let Some(stream) = self.stream.as_mut() {
+            let mut decoder = PlainDecoder::<T>::new(self.descr.type_length());
+            for _ in 0..num_values {
+                let mut encoded = Vec::new();
+                let length = if self.descr.physical_type() == crate::basic::Type::BYTE_ARRAY {
+                    let mut prefix = [0; 4];
+                    stream.read_exact(&mut prefix)?;
+                    let length = i32::from_le_bytes(prefix);
+                    let length = usize::try_from(length)
+                        .map_err(|_| general_err!("Negative PLAIN byte-array length"))?;
+                    encoded.extend_from_slice(&prefix);
+                    length
+                } else {
+                    usize::try_from(self.descr.type_length())?
+                };
+                if length > stream.remaining {
+                    return Err(general_err!("PLAIN value exceeds remaining page bytes"));
+                }
+                let start = encoded.len();
+                encoded.resize(start + length, 0);
+                stream.read_exact(&mut encoded[start..])?;
+                decoder.set_data(Bytes::from(encoded), 1)?;
+                let mut value = [T::T::default()];
+                if decoder.get(&mut value)? != 1 {
+                    return Err(general_err!("Insufficient streamed PLAIN values"));
+                }
+                out.push(std::mem::take(&mut value[0]));
+            }
+            return Ok(num_values);
+        }
         let encoding = self
             .current_encoding
             .expect("current_encoding should be set");
@@ -246,6 +319,20 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
     }
 
     fn skip_values(&mut self, num_values: usize) -> Result<usize> {
+        if let Some(stream) = self.stream.as_mut() {
+            for _ in 0..num_values {
+                let length = if self.descr.physical_type() == crate::basic::Type::BYTE_ARRAY {
+                    let mut prefix = [0; 4];
+                    stream.read_exact(&mut prefix)?;
+                    usize::try_from(i32::from_le_bytes(prefix))
+                        .map_err(|_| general_err!("Negative PLAIN byte-array length"))?
+                } else {
+                    usize::try_from(self.descr.type_length())?
+                };
+                stream.discard(length)?;
+            }
+            return Ok(num_values);
+        }
         let encoding = self
             .current_encoding
             .expect("current_encoding should be set");
